@@ -19,6 +19,7 @@ exec uv run python -m vllm.entrypoints.openai.api_server \
     --dtype bfloat16 \
     --max-model-len 8192 \
     --max-num-batched-tokens 2048 \
+    --speculative-config '{"method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 5, "prompt_lookup_min": 2}' \
     --gpu-memory-utilization 0.90 \
     --max-num-seqs 256 \
     --enable-prefix-caching \
