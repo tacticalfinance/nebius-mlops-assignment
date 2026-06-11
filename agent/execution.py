@@ -7,6 +7,7 @@ to decide whether the answer looks plausible.
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 
 from agent.schema import db_path
@@ -43,6 +44,16 @@ def execute_sql(db_id: str, sql: str, timeout_seconds: float = 5.0) -> Execution
             uri=True,
             timeout=timeout_seconds,
         ) as conn:
+            # `timeout=` above only bounds lock-wait time (SQLITE_BUSY), not
+            # query execution time. A model-generated query with e.g. a
+            # missing join condition can produce a huge cartesian product and
+            # run forever in fetchall(), permanently pinning a worker thread
+            # and a CPU core. Abort via the progress handler if a single
+            # statement runs past the deadline.
+            deadline = time.monotonic() + timeout_seconds
+            conn.set_progress_handler(
+                lambda: time.monotonic() > deadline, 1000
+            )
             cur = conn.execute(sql)
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchall()
