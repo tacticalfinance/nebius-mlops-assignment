@@ -35,11 +35,10 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema_for_question
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-# Cut 3 -> 2: eval data showed iter_2 pass rate (33.3%) == iter_1 (33.3%),
-# so the 3rd call (2nd revise) added no accuracy but did add a full
-# sequential vLLM round-trip to worst-case agent latency.
-MAX_ITERATIONS = 2
+# Baseline is 3 so the eval can measure pass rate at iter 0/1/2 on the real
+# 30B endpoint; whether the 2nd revise earns its sequential vLLM round-trip
+# is then a Phase 6 tuning decision grounded in that data.
+MAX_ITERATIONS = 3
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
