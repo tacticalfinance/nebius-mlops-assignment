@@ -27,9 +27,20 @@ Rules:
 - For "difference between/of A and B", compute A - B in exactly the order
   stated in the question.
 - Prefer explicit JOINs with ON clauses over implicit comma joins.
+- Join tables only along the foreign-key relationships shown in the schema:
+  if A.x references B.id, never compare A.x against some other table's id.
 - Return only the columns needed to answer the question - no extra columns.
-- Use DISTINCT when the question asks for a list of values and duplicates are
-  possible because of joins.
+  For a person's "full name", select the stored name columns separately
+  (e.g. first_name, last_name) - do not concatenate them.
+- When the answer is a category/label stored in a column (e.g. "are they
+  mostly X or Y?"), return the stored value exactly as it appears in the data
+  (e.g. '+' or '-'), not an English paraphrase of it.
+- Use DISTINCT when a JOIN can duplicate rows while looking up attributes of
+  a single entity. But never add DISTINCT or LIMIT 1 to a plain single-table
+  lookup that may legitimately match multiple rows - return them all.
+- When filtering by a human-readable name (a set name, a status name), JOIN
+  the lookup table and filter on its name column - never guess short codes
+  or ids from memory.
 - If the question asks for a count, list, max/min, or aggregate, use the
   appropriate SQL construct (COUNT, GROUP BY, ORDER BY ... LIMIT, etc).
 - For highest/lowest/top-k questions, prefer ORDER BY ... LIMIT unless the

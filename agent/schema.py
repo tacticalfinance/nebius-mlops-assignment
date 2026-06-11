@@ -212,7 +212,7 @@ def render_schema_for_question(
     db_id: str,
     question: str,
     *,
-    max_chars: int = 9000,
+    max_chars: int = 12000,
     min_tables: int = 2,
     max_tables: int = 8,
 ) -> str:
