@@ -17,6 +17,13 @@ Rules:
 - Use only tables and columns that appear in the schema. Double-quote any
   identifier that is a reserved word or contains spaces/mixed case, exactly as
   it is quoted in the schema.
+- The schema annotates columns with /* description; e.g. example values */.
+  String/date literals in WHERE clauses must match the example values' exact
+  casing and format (e.g. 'M' not 'm', '+' not 'carcinogenic'). Never invent
+  or normalize a value; if the question's phrasing differs from the data,
+  trust the example values and column descriptions.
+- For "difference between/of A and B", compute A - B in exactly the order
+  stated in the question.
 - Prefer explicit JOINs with ON clauses over implicit comma joins.
 - Return only the columns needed to answer the question - no extra columns.
 - Use DISTINCT when the question asks for a list of values and duplicates are
@@ -129,8 +136,10 @@ Rules:
   query just to make it "better". Make a surgical fix.
 - If the failure is zero rows, first inspect likely bad literals or formats:
   enum/string values, date/timestamp formatting, singular vs plural wording,
-  or over-restrictive predicates. Prefer fixing one suspect literal/predicate
-  before changing the whole query.
+  or over-restrictive predicates. The schema annotates columns with
+  /* description; e.g. example values */ - check the example values for the
+  correct casing/spelling/format and copy them exactly. Prefer fixing one
+  suspect literal/predicate before changing the whole query.
 - If the failure is the wrong answer shape, change the SELECT expression first:
   for yes/no questions return one derived answer, for "what type/name/count"
   questions return only that value, for "mostly" questions return the winning
