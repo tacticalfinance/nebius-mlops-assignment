@@ -1,7 +1,8 @@
 """FastAPI wrapper exposing the agent over HTTP.
 
-Run:
-    uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
+Run (final Phase 6 config - multiple workers are required to hold the SLO,
+see scripts/start_agent.sh and REPORT.md iteration 1):
+    uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001 --workers 8
 
 The /answer endpoint accepts {question, db, tags?} and returns the
 agent's final SQL, the result rows, and per-iteration history.

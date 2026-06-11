@@ -2,93 +2,78 @@
 
 ## 1. Serving configuration (Phase 1)
 
-Hardware: 1× H100 80GB. Model: `Qwen/Qwen3-30B-A3B-Instruct-2507` (MoE, 30B total / ~3B active params).
-
-Workload shape driving the choices: 1.5–3K-token prompts (mostly repeated DB schemas), short structured outputs (SQL / small JSON, ≤256 tokens), 2–3 *sequential* vLLM calls per agent run, SLO of p95 < 5s end-to-end at 10+ RPS (so ~20–30 LLM calls/s at the serving layer).
-
-Baseline flags (`scripts/start_vllm.sh`) and rationale:
+1× H100 80GB, `Qwen/Qwen3-30B-A3B-Instruct-2507` (MoE, 30B total / ~3B active). Workload: 1.5–3K-token prompts (repeated DB schemas), short structured outputs (≤256 tokens), 2–4 *sequential* vLLM calls per agent run, SLO p95 < 5s at 10+ RPS (~20–30 LLM calls/s).
 
 | Flag | Value | Why |
 |---|---|---|
-| `--dtype` | `bfloat16` | Native checkpoint precision; ~57 GB of weights fits in 80 GB with room for KV cache. Quantization (e.g. FP8) is deliberately kept in reserve as a Phase 6 lever if KV headroom or decode speed becomes the bottleneck. |
-| `--max-model-len` | `8192` | Qwen3's native window (262K) would make vLLM budget KV for sequences we never see. Prompts top out ~3K + 256 output tokens, so 8K is generous; capping it lets far more concurrent sequences fit in the same KV pool — concurrency is what the 10 RPS target actually stresses. |
-| `--gpu-memory-utilization` | `0.90` | Standard starting point: maximizes the KV-cache pool while leaving headroom for activations and CUDA graphs. |
-| `--max-num-seqs` | `256` | vLLM's default, set explicitly so it's a documented tuning lever. With 3B active params per token, MoE decode is cheap per-sequence — batch capacity should not be the first ceiling we hit. |
-| `--enable-prefix-caching` | on | The biggest workload-specific win: every request embeds a rendered DB schema, and each agent run makes 2–3 calls sharing that same prefix. Cached prefixes turn most prefill work into cache hits → lower TTFT and less compute per request. (Validated by the prefix-cache-hit-ratio panel in Grafana.) |
-| `--disable-log-requests` | on | Keeps server logs readable during 5-minute load tests; per-request logging is pure noise at 20+ calls/s. |
+| `--dtype` | `bfloat16` | Native precision; ~57 GB fits in 80 GB with KV room. FP8 deliberately held in reserve as a Phase 6 lever. |
+| `--max-model-len` | `8192` | Qwen3's 262K window would budget KV for sequences we never see; prompts top out ~3K + 256 out. Capping it buys concurrency, which is what 10 RPS stresses. |
+| `--gpu-memory-utilization` | `0.90` | Maximize KV pool, leave headroom for activations/CUDA graphs. |
+| `--max-num-seqs` | `256` | Default, made explicit as a tuning lever; 3B-active MoE decode is cheap per sequence, so batch capacity shouldn't be the first ceiling. |
+| `--enable-prefix-caching` | on | The workload-specific win: every request embeds a rendered schema and each run's 2–4 calls share that prefix. Validated by the hit-ratio panel (~85% under load). |
+| `--disable-log-requests` | on | Readable logs at 20+ calls/s. |
+| `--speculative-config` | ngram, 5 tokens | *Added in Phase 6 iteration 4* — SQL output copies schema/question tokens from the prompt; prompt-lookup drafts verify losslessly. See §6. |
 
-What's intentionally *not* tuned yet (Phase 6 candidates): FP8 quantization / FP8 KV cache, `--max-num-batched-tokens` (prefill chunking vs TTFT), scheduler knobs, speculative decoding.
-
-**Sanity check:** server up, manual eval-set queries return sensible SQL (e.g. `SELECT c.lat, c.lng FROM circuits c JOIN races r ON c.circuitId = r.circuitId WHERE r.name = 'Australian Grand Prix'`), and the server log already shows a 27–40% prefix-cache hit rate on repeated-schema prompts — see `screenshots/vllm_manual_query.png`.
+Sanity check: manual eval-set queries return correct SQL; server log already showed 27–40% prefix-cache hits (`screenshots/vllm_manual_query.png`).
 
 ## 2. Observability dashboard (Phase 2)
 
-Dashboard: `infra/grafana/provisioning/dashboards/serving.json`, three rows mirroring the three questions an on-call would ask:
+`infra/grafana/provisioning/dashboards/serving.json` — three rows for the three on-call questions: **Latency** (E2E p50/p95/p99, queue/prefill/decode lifecycle breakdown, TTFT, ITL — "is it slow and *where*?"), **Throughput** (running/waiting, gen & prompt tokens/s, completed req/s — queue depth is the earliest saturation signal), **KV cache** (usage fraction, prefix-hit ratio).
 
-- **Latency** — E2E request latency (p50/p95/p99), lifecycle breakdown (queue vs prefill vs decode, p95), TTFT, inter-token latency. Answers "is it slow, and *where* in the lifecycle?"
-- **Throughput** — running/waiting requests, generated tokens/s, prompt tokens/s, completed requests/s. Queue depth is the earliest saturation signal.
-- **KV cache** — usage fraction (headroom / eviction risk) and prefix-cache hit ratio (validates `--enable-prefix-caching` for this schema-heavy workload).
-
-Validated with a 3 RPS / 180s agent-level burst (540 requests, 0 errors) — every panel reacts (`screenshots/grafana_serving.png`). Readings at 3 RPS: agent E2E p50 0.81s / p95 2.90s; lifecycle p95 is decode-dominated (~1.2s) with queue ≈ 0; TTFT p95 ~70ms; ~300 gen tok/s out, ~4K prompt tok/s in; vLLM completes ~8 req/s (≈ 3 agent runs/s × 2–3 calls each, as expected); **KV cache usage peaked ~2%** and prefix-cache hit ratio climbed to ~70%. Takeaway for Phase 6: at low load the system is decode-bound with enormous KV headroom — concurrency, not memory, will be the thing to stress.
+Validated with a 3 RPS / 180s burst, all panels reacting (`screenshots/grafana_serving.png`): decode-dominated lifecycle, queue ≈ 0, TTFT p95 ~70ms, KV peak ~2%, prefix hits ~70%. Read-across for Phase 6: decode-bound with huge KV headroom — concurrency, not memory, is what will break.
 
 ## 3. Agent (Phase 3)
 
-LangGraph graph: `attach_schema → generate_sql → execute → verify →` (ok → END | not ok → `revise → execute → verify`, capped at `MAX_ITERATIONS`). Verify asks for strict one-line JSON `{ok, issue}`, parsed defensively; execution errors are never accepted regardless of the verifier's opinion (fail closed). Revise sees the failing SQL, its execution result, the verifier's issue, and all prior attempts so it doesn't repeat them.
+LangGraph: `attach_schema → generate_sql → execute → verify` → ok ? END : `revise → execute → verify`, capped at `MAX_ITERATIONS`. Verify returns strict one-line JSON `{ok, issue}`, parsed defensively; execution errors are never accepted regardless of the verifier (fail closed). Revise sees the failing SQL, execution output, verifier issue, and all prior attempts.
 
-Revise trigger observed in interactive testing (10 eval questions → 1 revise): on *"What is the average fastest lap time in seconds for Lewis Hamilton…"* (`formula_1`), the first generation referenced a non-existent column and errored; verify failed it with *"the column 'l.fastestLapTime' does not exist, making the result unusable"*, revise corrected the column and the second execution succeeded (2 iterations total). This is the loop working as designed: execution errors are the highest-signal failure class and are always routed to revise.
+Observed revise trigger: *"average fastest lap time for Lewis Hamilton"* — first SQL referenced a non-existent column, verify failed it (*"column 'l.fastestLapTime' does not exist"*), revise fixed it, second execution succeeded.
 
 ## 4. Tracing (Phase 4)
 
-Langfuse (local, docker-compose) captures every agent run via the LangChain callback handler. `screenshots/langfuse_trace.png` shows a full revise-loop waterfall on the Lewis Hamilton question: `attach_schema → generate_sql → execute → verify (fail) → revise → execute`, each LLM span carrying its prompt, response, latency and token count (1.47s total, 3.7K prompt / 233 completion tokens — the prompt weight is the rendered schema, which is what makes prefix caching matter). Traces are tagged via the `langfuse_tags` metadata key with `phase:*` (`phase4_smoke` / `eval` / `load_test`) and `db_id:*`, so Phase 6 load-test traces are filterable from eval traces (`screenshots/langfuse_tags.png`).
+Langfuse (local) captures every run via the LangChain callback. `screenshots/langfuse_trace.png`: full revise-loop waterfall with per-span prompt/response/latency/tokens (1.47s, 3.7K prompt / 233 completion — prompt weight is the schema, which is why prefix caching matters). Traces tagged via `langfuse_tags` with `phase:*` and `db_id:*`, so load-test traffic is filterable from eval runs (`screenshots/langfuse_tags.png`).
 
 ## 5. Baseline eval (Phase 5)
 
-Method: execution accuracy — agent SQL and gold SQL both run against the target DB, result sets compared after canonicalization (rows sorted, cells stringified, NULL→''). Scored per iteration from the agent's history with carry-forward, so `iter_k` = "pass rate had we stopped after k+1 attempts".
+Execution accuracy: agent SQL and gold SQL run against the target DB, row sets compared canonicalized (sorted, stringified, NULL→''). Per-iteration scoring with carry-forward: `iter_k` = pass rate had we stopped after k+1 attempts. Reaching the baseline took three tuning iterations against the real 30B:
 
-Getting to the baseline took three prompt/context-engineering iterations against the real 30B (final tuning on the real endpoint, per the assignment):
-
-| Agent version | overall | iter_0 → iter_2 |
+| Agent version | overall | per-iteration |
 |---|---|---|
-| v0: bare schema (names+types only) | 30% | 30% → 30% (flat) |
-| v1: + value examples & BIRD column descriptions | 26.7% | flat — annotations fixed literals (`'M'`, `A15`, date formats) but inflated DDL blew the 4400-char pruning budget; dropped tables caused hallucinated columns |
-| v2: budget 9000, redundant-desc filter | 36.7% | flat |
-| **v3 (baseline): budget 12000 + 5 targeted SQL rules** | **50%** | **43.3% → 50%** |
+| v0: bare schema (names+types) | 30% | flat |
+| v1: + sampled value examples & BIRD column descriptions | 26.7% | flat — fixed literals but bigger DDL blew the schema-pruning budget; dropped tables → hallucinated columns |
+| v2: bigger budget, redundant-desc filter | 36.7% | flat |
+| **v3 (baseline): 12K-char budget + 5 targeted SQL rules** | **50%** | **43.3% → 50%** |
 
-The dominant failure class was the model guessing data it cannot see (literal casing `'m'`/`'M'`, labels `'carcinogenic'`/`'+'`, invented set codes, cryptic columns like `financial.A15`). Annotating the schema with sampled example values + BIRD column descriptions fixed most of it — but only once the schema budget was large enough that the pruner never drops a needed table.
+The dominant failure class was the model guessing data it can't see (`'m'` vs `'M'`, `'carcinogenic'` vs `'+'`, invented set codes, cryptic `financial.A15`). Schema annotations fixed it — but only once the budget guaranteed no needed table is pruned.
 
-**Does the loop earn its keep?** In v0–v2: no — verify/revise never flipped an outcome (revise had no signal to fix a bad literal it couldn't see either). In the final baseline: yes — iter_0→iter_1 is +6.7pp (2/30 questions recovered, mostly execution-error repairs now that revise can consult example values); iter_2 adds nothing. Remaining failures are largely gold-SQL quirks (gold returns `id` where the question asks for names, paraphrased answer strings, gold's column order differing from the question's own order) — honest eval noise rather than agent defects.
-
-Artifacts: `results/eval_baseline.json`, `screenshots/grafana_eval_run.png`.
+**Does the loop earn its keep?** v0–v2: no — flat curve; revise had no signal to fix unseen literals. v3: yes — +6.7pp at iter_1 (2/30 recovered, mostly execution-error repairs), iter_2 adds 0pp. Remaining failures are largely gold-SQL quirks (gold returns `id` for "list cards", paraphrased answer strings, gold column order differing from the question's own order). Artifacts: `results/eval_baseline.json`, `screenshots/grafana_eval_run.png`.
 
 ## 6. SLO: load test & tuning (Phase 6)
 
-Target: **p95 end-to-end agent latency < 5s at 10+ RPS over 5 minutes.**
+Target: **p95 < 5s at 10+ RPS over 5 min.** Baseline (10 RPS / 300s): p50 4.4s, **p95 55.4s**, p99 61.4s, 2997/3000 ok (3 client-side connection errors) — missed 11× (`results/load_test_baseline.json`, `screenshots/grafana_before.png`).
 
-**Baseline (10 RPS / 300s, 3000 requests):** p50 4.4s, **p95 55.4s**, p99 61.4s — SLO missed by 11×. (`results/load_test_baseline.json`, `screenshots/grafana_before.png`.)
+Iteration log — every entry: saw → hypothesized → changed (one thing) → result:
 
-Iteration log (saw X → hypothesized Y → changed Z → result W):
+1. **Saw** agent p95 55s while vLLM looked healthy (vLLM E2E p95 ~5–6s, queue recovering, KV ≤40%, sawtooth "running" curve). **Hypothesized** the gap is agent-side: sync `/answer` holds one of ~40 threadpool threads per request; 10 RPS × ~5s needs 50+. **Changed** `uvicorn --workers 8`. **Result** p95 → **9.8s** (5.6×); sawtooth gone, steady ~25 req/s into vLLM.
+2. **Saw** p95 ≈ 2× vLLM per-call latency; tail = revise path (`MAX_ITERATIONS=3` ⇒ worst case 6 sequential calls). **Hypothesized** the 2nd revise is pure tail: Phase 5 measured iter_1 = iter_2 = 50%. **Changed** cap 3 → 2. **Result** p95 → **6.3s**, p99 22→14s; zero quality cost by construction.
+3. **Saw** decode-dominated lifecycle, ITL p95 ~50ms, TTFT/KV with huge headroom; ~40K prompt tok/s of prefill chunked into decode steps (8192/step budget). **Hypothesized** prefill chunks inflate every decode step; trade TTFT headroom for ITL. **Changed** `--max-num-batched-tokens 2048`. **Result** p95 6.31→6.20s — **flat; hypothesis wrong** (prefill interference was secondary).
+4. **Saw** latency tracking raw decode (~100–150 tokens × 30–50ms × 2–4 sequential calls). **Hypothesized** SQL output copies prompt tokens → ideal for lossless n-gram speculative decoding. **Changed** `--speculative-config` (ngram, 5 draft tokens). **Result** p95 → **5.57s**, ITL p99 80→68ms — but a *new* symptom appeared: "waiting" sustained at 15–25 ≈ "running".
+5. **Saw** sustained queue ≈ running; Little's law ⇒ ~0.7–1.1s queueing per call. **Hypothesized** iteration 3's 2048 budget, neutral before speculation, became binding once decode sped up: admission is now the bottleneck. **Changed** reverted to default budget, kept speculation. **Result** p95 → **4.79s** — SLO met (p50 1.49s, p99 12.1s, 3000/3000 ok at 10 RPS / 300s).
 
-1. **Saw**: agent p95 55s while the dashboard showed vLLM perfectly healthy — vLLM-side E2E p95 only ~5–6s, queue depth oscillating 0–30 and recovering, KV cache ≤40%, TTFT p95 ~200ms, and a sawtooth "running" curve (waves of work, then dips to 0). **Hypothesized**: the ~50s gap lives in the agent layer, not the GPU — `/answer` is a sync FastAPI endpoint, so each request holds one of anyio's ~40 threadpool threads for its whole multi-second graph run; at 10 RPS × ~5s that needs 50+ concurrent slots → requests queue inside the agent server. **Changed**: `uvicorn --workers 8` (one change; no vLLM flags touched). **Result**: p95 55.4s → **9.8s** (5.6×), p50 4.4s → 1.7s; dashboard now shows a steady ~20–25 running plateau and flat ~25 completed req/s — the sawtooth gone, full offered load reaching vLLM (`results/load_test_iter1.json`).
-2. **Saw**: agent p95 (9.8s) ≈ 2× vLLM per-call p95 (~5s); lifecycle breakdown decode-dominated; the agent's tail is the revise path — `MAX_ITERATIONS=3` means a worst-case run chains 6 sequential vLLM calls. **Hypothesized**: the 2nd revise is pure tail latency, because Phase 5 measured iter_1 = iter_2 = 50% (zero accuracy from the 3rd attempt). **Changed**: `MAX_ITERATIONS` 3 → 2 (worst case 6 → 4 sequential calls). **Result**: p95 9.8s → **6.3s**, p99 22.3s → 14.4s, 3000/3000 ok — pure tail win, zero quality cost by construction (`results/load_test_iter2.json`).
-3. **Saw**: p95 6.3s, still 1.3s over SLO; lifecycle p95 decode-dominated with ITL p95 ~50ms / p99 ~80ms at batch ~25, while TTFT (~200ms) and KV (≤40%) have huge headroom. **Hypothesized**: with ~40K prompt tokens/s of prefill being chunked into the same engine steps as decode (default budget 8192 tokens/step), every decode step also carries large prefill chunks — inflating ITL for all running requests; trading some of our abundant TTFT headroom for smoother decode should cut the dominant component. **Changed**: `--max-num-batched-tokens 2048` (one flag; model unchanged). **Result**: p95 6.31s → 6.20s, p99 14.4s → 13.2s — essentially flat. Honest lesson: the targeted interference effect was secondary; prefill chunking was not what the SLO was waiting on (`results/load_test_iter3.json`).
-4. **Saw**: latency now tracks raw decode time — ~100–150 output tokens × 30–50ms ITL ≈ 3–5s per generate call, ×2–4 sequential calls per run. **Hypothesized**: SQL output mostly copies tokens already present in the prompt (schema identifiers, question literals) — ideal for n-gram prompt-lookup speculative decoding, which drafts multi-token spans from the prompt and verifies them in one step (lossless, no quality risk). **Changed**: `--speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":5,"prompt_lookup_min":2}'`. **Result**: p95 6.20s → **5.57s**; ITL p99 80→68ms / p50 ~20ms confirmed speculation accepting drafts — but the dashboard also showed a *new* symptom: "requests waiting" sustained at 15–25, as large as "running" (`results/load_test_iter4.json`).
-5. **Saw**: sustained queue depth ≈ running depth (~15–25 each) with ~40K prompt tok/s offered; by Little's law that is ~0.7–1.1s of queueing per call — while lifecycle decode improved. **Hypothesized**: iteration 3's `--max-num-batched-tokens 2048`, neutral before speculation, became the binding constraint once decode sped up: prefill admission is now the bottleneck. **Changed**: reverted to the default prefill budget (dropped the flag), keeping speculation. **Result**: p95 5.57s → **4.79s** — SLO met (p50 1.49s, p99 12.1s, 3000/3000 ok at 10 RPS / 300s; `results/load_test_iter5.json`). The queueing predicted by Little's law came off the latency exactly as hypothesized.
+Before/after: `screenshots/grafana_before.png` (sawtooth, 55s p95) vs `grafana_after.png` (queue ≈ 0, steady ~23 req/s, ITL p95 ~48ms).
 
-Before/after evidence: `screenshots/grafana_before.png` (baseline: sawtooth running curve, agent p95 55s while vLLM idles between waves) vs `screenshots/grafana_after.png` (final config at 10 RPS: queue depth ≈ 0, steady ~23 completed req/s, ITL p95 ~48ms, vLLM E2E p95 ~2s).
+**Quality after tuning** (`results/eval_after_tuning.json`): 50%, per-iteration 43.3% → 50% — identical to baseline; expected (cap removed a measured-useless attempt; speculation is lossless) but measured, not assumed.
 
-**Quality after tuning** (`results/eval_after_tuning.json`): overall **50%**, per-iteration 43.3% → 50% — *identical* to baseline. Expected by construction (the iteration cap removed only a measured-useless attempt; n-gram speculation is lossless), but measured rather than assumed.
-
-**Verdict: SLO met.** p95 4.79s < 5s at 10 RPS over 5 minutes (3000/3000 ok), vs 55.4s baseline — an 11.6× improvement from five one-change iterations, with quality exactly preserved. Remaining honest caveat: p99 is 12.1s — the revise-path tail (4 sequential vLLM calls) cannot fit 5s; an SLO on p99 would force an architecture change, not a config change (see §8). The decisive lesson of the cycle was iterations 3→5: a flag that was neutral under one bottleneck regime (`--max-num-batched-tokens 2048` pre-speculation) silently became the binding constraint after the decode bottleneck was removed — only the queue-depth panel exposed it.
+**Verdict: SLO met** — p95 4.79s vs 55.4s baseline (11.6×), quality exactly preserved. Caveats kept honest: p99 is 12.1s (the revise path can't fit 5s; a p99 SLO would need an architecture change, see §8), and iteration 3 was a wrong hypothesis whose flag later *became* the bottleneck — only the queue-depth panel exposed that regime shift.
 
 ## 7. Agent value
 
-The loop earns its keep, but only after it was given data to work with. Final numbers: iter_0 (single-shot) = 43.3%, iter_1 = 50% — the verify→revise loop recovers +6.7pp (2/30 questions), mostly by repairing execution errors (hallucinated columns) and zero-row results where the schema's example values tell revise the correct literal. iter_2 added exactly 0pp, which is why `MAX_ITERATIONS=2` is the final config — that measurement converted directly into a 3.5s p95 reduction in Phase 6. Notably, in the pre-annotation agent (v0–v2) the per-iteration curve was completely flat: a revise loop is only as good as the signal it can act on. The cost side: the verify call adds one sequential LLM round-trip (~1s) to every request, and the loop accounts for the 12s p99 tail; at 50% vs 43.3%, that trade is defensible for an analytics PoC but should be re-validated on a bigger eval set.
+The loop earns its keep, but only once it had data to act on. Final: iter_0 43.3% → iter_1 50% (+6.7pp, 2/30 — execution-error repairs and zero-row fixes where schema example values supply the correct literal); iter_2 adds 0pp, which is why `MAX_ITERATIONS=2` — that measurement converted directly into a 3.5s p95 cut in Phase 6. In the pre-annotation agent the curve was flat: a revise loop is only as good as its signal. Costs: one extra sequential verify call (~1s) per request and the 12s p99 tail; defensible for a PoC, but the +6.7pp should be re-validated on a larger eval set (30 questions ⇒ wide confidence intervals).
 
 ## 8. What I'd do with more time
 
-- **Parallel self-consistency instead of a deeper loop**: sample 3 generations at temperature >0 *in parallel*, execute all, majority-vote on canonicalized result sets. Per-iteration data shows sequential retries plateau after one revise; parallel sampling attacks the same failure class (plausible-but-wrong SQL that verify can't catch) without adding sequential latency — and the KV/compute headroom for it is sitting visibly unused on the dashboard.
-- **Merge verify into generate**: ask for `{sql, self_check}` in one structured response, keeping the separate verify call only for executions that error or return 0 rows. Cuts one sequential round-trip (~1s) off *every* request and would attack the p99 tail directly.
-- **Statistical power for the eval**: 30 questions means ±18pp confidence at 50% — the +6.7pp loop gain is suggestive, not proven. Scale to 200+ BIRD dev questions (the harness already handles it) and stratify by DB before trusting any prompt change.
-- **Schema linking by retrieval**: replace the token-overlap table pruner with embedding-based retrieval over tables/columns, measured by "needed-table recall" on the eval set — the v1 regression showed table dropping is the single most destructive failure mode.
-- **FP8 A/B**: the official FP8 checkpoint should cut decode ITL meaningfully at our batch sizes; one load test + one eval run would quantify the latency win and the quality cost. It was the next lever if iteration 5 had missed.
-- **Use the Langfuse tags in anger**: aggregate per-node latency from `phase:load_test` traces to quantify exactly where the 12.1s p99 requests spend time (which node, which iteration), and confirm the 51s max outliers are cold prefix-cache misses on first-seen DBs rather than something pathological.
+- **Parallel self-consistency**: 3 samples at temp>0 *in parallel*, execute all, majority-vote on canonicalized rows — attacks plausible-but-wrong SQL (which verify can't catch) without sequential latency; the KV headroom for it is visibly idle.
+- **Merge verify into generate** (`{sql, self_check}` in one response), keeping a separate verify only for errors/0-rows — removes ~1s from every request and attacks the p99 tail.
+- **Eval statistical power**: 30 questions ⇒ ±18pp at 50%; scale to 200+ BIRD dev questions and stratify per DB before trusting prompt changes.
+- **Schema linking by embedding retrieval** instead of token overlap, measured by needed-table recall — v1's regression showed table-dropping is the most destructive failure mode.
+- **FP8 A/B**: official FP8 checkpoint vs bf16 — one load test + one eval to quantify ITL gain vs quality cost; it was the next lever if iteration 5 had missed.
+- **Mine the Langfuse tags**: per-node latency aggregation over `phase:load_test` traces to attribute the 12.1s p99 (which node, which iteration) and confirm the ~51s max outliers are cold prefix-cache misses on first-seen DBs.
