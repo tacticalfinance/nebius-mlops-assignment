@@ -77,10 +77,14 @@ def _column_descriptions(db_id: str) -> dict[tuple[str, str], str]:
             col = (row.get("original_column_name") or "").strip()
             if not col:
                 continue
+            col_norm = re.sub(r"[^a-z0-9]", "", col.lower())
             parts = []
             for key in ("column_description", "value_description"):
                 text = _clean_text(row.get(key) or "")
-                if text and text.lower() != col.lower():
+                # Skip descriptions that just restate the column name
+                # ("school name" for SchoolName) - they cost prompt budget
+                # without informing the model.
+                if text and re.sub(r"[^a-z0-9]", "", text.lower()) != col_norm:
                     parts.append(text)
             desc = "; ".join(parts)
             if not desc:
@@ -208,9 +212,9 @@ def render_schema_for_question(
     db_id: str,
     question: str,
     *,
-    max_chars: int = 4400,
+    max_chars: int = 9000,
     min_tables: int = 2,
-    max_tables: int = 6,
+    max_tables: int = 8,
 ) -> str:
     """Render only the most relevant tables for a question.
 

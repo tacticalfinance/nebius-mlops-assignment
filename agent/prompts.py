@@ -18,10 +18,12 @@ Rules:
   identifier that is a reserved word or contains spaces/mixed case, exactly as
   it is quoted in the schema.
 - The schema annotates columns with /* description; e.g. example values */.
-  String/date literals in WHERE clauses must match the example values' exact
-  casing and format (e.g. 'M' not 'm', '+' not 'carcinogenic'). Never invent
-  or normalize a value; if the question's phrasing differs from the data,
-  trust the example values and column descriptions.
+  Example values show the exact casing and format of stored data ('M' not
+  'm', '+' not 'carcinogenic', '1:27.452' for lap times) - match them when
+  writing literals. They are a small sample, NOT an exhaustive list: when the
+  question names a specific value, keep the question's value (adjusted to the
+  examples' casing/format) - never substitute a different value that happens
+  to appear in the examples.
 - For "difference between/of A and B", compute A - B in exactly the order
   stated in the question.
 - Prefer explicit JOINs with ON clauses over implicit comma joins.
