@@ -33,7 +33,11 @@ async def fire_one(
     question: dict,
     results: list[dict],
 ) -> None:
-    payload = {"question": question["question"], "db": question["db_id"]}
+    payload = {
+        "question": question["question"],
+        "db": question["db_id"],
+        "tags": {"phase": "load_test", "db_id": question["db_id"]},
+    }
     t0 = time.monotonic()
     status = "ok"
     err: str | None = None

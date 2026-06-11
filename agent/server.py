@@ -55,7 +55,13 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     callbacks: list[Any] = []
     if _langfuse_enabled:
         callbacks = [_LFHandler()]
-    config: dict[str, Any] = {"callbacks": callbacks, "metadata": req.tags}
+    # `langfuse_tags` is a special metadata key the Langfuse LangChain handler
+    # maps to real trace tags, so runs are filterable in the trace list
+    # (e.g. phase:eval vs phase:load_test in Phase 6).
+    metadata: dict[str, Any] = dict(req.tags)
+    if req.tags:
+        metadata["langfuse_tags"] = [f"{k}:{v}" for k, v in req.tags.items()]
+    config: dict[str, Any] = {"callbacks": callbacks, "metadata": metadata}
     try:
         final = graph.invoke(state, config=config)
     except Exception as e:  # noqa: BLE001
