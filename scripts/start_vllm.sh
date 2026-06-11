@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Start vLLM with the baseline (Phase 1) configuration.
+# Start vLLM with the final tuned configuration.
 # Reference: https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
 #
-# This is the *initial* config, chosen for the workload shape
-# (1.5-3K-token prompts, short structured outputs, 2-3 dependent calls
-# per agent run). It will be iterated on in Phase 6 against the SLO.
-# Rationale for every flag lives in REPORT.md (Phase 1 section).
+# Phase 1 baseline flags + the one serving-side change that survived the
+# Phase 6 SLO iterations: n-gram speculative decoding (SQL output largely
+# copies schema/question tokens already in the prompt, so prompt-lookup
+# drafts verify cheaply and losslessly). Rationale for every flag and the
+# full iteration log live in REPORT.md (sections 1 and 6).
 
 set -euo pipefail
 
