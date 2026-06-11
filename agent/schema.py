@@ -41,7 +41,8 @@ def _q(ident: str) -> str:
 
 
 def _clean_text(value: str) -> str:
-    return " ".join(value.replace("*/", "").split())
+    # \ufffd: BIRD CSVs mix encodings; replacement chars are noise in prompts.
+    return " ".join(value.replace("*/", "").replace("\ufffd", " ").split())
 
 
 @lru_cache(maxsize=32)
