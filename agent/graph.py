@@ -35,10 +35,11 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema_for_question
 
 # Total generate + revise calls before the loop is forced to stop.
-# Baseline is 3 so the eval can measure pass rate at iter 0/1/2 on the real
-# 30B endpoint; whether the 2nd revise earns its sequential vLLM round-trip
-# is then a Phase 6 tuning decision grounded in that data.
-MAX_ITERATIONS = 3
+# Phase 6 tuning: cut 3 -> 2. The H100 baseline eval measured per-iteration
+# pass rate at iter_0=43.3%, iter_1=50%, iter_2=50% - the second revise adds
+# zero accuracy while chaining two more sequential vLLM calls (revise+verify)
+# onto the worst-case agent latency path.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")

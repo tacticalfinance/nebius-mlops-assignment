@@ -64,13 +64,12 @@ Artifacts: `results/eval_baseline.json`, `screenshots/grafana_eval_run.png`.
 
 Target: **p95 end-to-end agent latency < 5s at 10+ RPS over 5 minutes.**
 
-Baseline: _TODO._
+**Baseline (10 RPS / 300s, 3000 requests):** p50 4.4s, **p95 55.4s**, p99 61.4s — SLO missed by 11×. (`results/load_test_baseline.json`, `screenshots/grafana_before.png`.)
 
 Iteration log (saw X → hypothesized Y → changed Z → result W):
 
-1. _TODO_
-
-Before/after evidence: `screenshots/grafana_before.png`, `screenshots/grafana_after.png`.
+1. **Saw**: agent p95 55s while the dashboard showed vLLM perfectly healthy — vLLM-side E2E p95 only ~5–6s, queue depth oscillating 0–30 and recovering, KV cache ≤40%, TTFT p95 ~200ms, and a sawtooth "running" curve (waves of work, then dips to 0). **Hypothesized**: the ~50s gap lives in the agent layer, not the GPU — `/answer` is a sync FastAPI endpoint, so each request holds one of anyio's ~40 threadpool threads for its whole multi-second graph run; at 10 RPS × ~5s that needs 50+ concurrent slots → requests queue inside the agent server. **Changed**: `uvicorn --workers 8` (one change; no vLLM flags touched). **Result**: p95 55.4s → **9.8s** (5.6×), p50 4.4s → 1.7s; dashboard now shows a steady ~20–25 running plateau and flat ~25 completed req/s — the sawtooth gone, full offered load reaching vLLM (`screenshots/grafana_after.png`, `results/load_test_iter1.json`).
+2. **Saw**: agent p95 (9.8s) ≈ 2× vLLM per-call p95 (~5s); lifecycle breakdown decode-dominated; the agent's tail is the revise path — `MAX_ITERATIONS=3` means a worst-case run chains 6 sequential vLLM calls. **Hypothesized**: the 2nd revise is pure tail latency, because Phase 5 measured iter_1 = iter_2 = 50% (zero accuracy from the 3rd attempt). **Changed**: `MAX_ITERATIONS` 3 → 2 (worst case 6 → 4 sequential calls). **Result**: _pending._
 
 Quality after tuning: _TODO — `results/eval_after_tuning.json` vs baseline._
 
